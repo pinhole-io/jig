@@ -2,6 +2,8 @@
 //!
 //! This crate has no server, sandbox, or tool set. Callers supply the
 //! tool registry, the completer, and the drivers.
+//!
+//! Guides live in `docs/`. Runnable programs live in `examples/`.
 
 pub mod agent;
 pub mod clock;

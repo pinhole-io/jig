@@ -157,6 +157,25 @@ impl PromptBlocks {
 /// Renders prompt slots into stable and volatile provider blocks.
 ///
 /// Disk rules stay with the host. Pass their text to [`PromptBuilder::build_with_rules`].
+///
+/// # Examples
+///
+/// ```
+/// use jig::{PromptBuilder, PromptContext, PromptSlots};
+/// use jiff::Timestamp;
+///
+/// let blocks = PromptBuilder::new(
+///     PromptContext {
+///         user_text: "Hello",
+///         system_note: "",
+///         current_time: Timestamp::now(),
+///     },
+///     PromptSlots::with_identity("Answer in one paragraph."),
+/// )
+/// .build()
+/// .expect("prompt fits");
+/// assert!(!blocks.cached.is_empty());
+/// ```
 pub struct PromptBuilder<'a> {
     context: PromptContext<'a>,
     slots: PromptSlots,
