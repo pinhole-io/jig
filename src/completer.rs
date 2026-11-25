@@ -303,9 +303,19 @@ impl Completer for SuperGlueCompleter {
             options.max_tool_rounds = max_tool_rounds;
             options.answer_after_tool_cap = answer_after_tool_cap;
             options.reasoning_effort = Some(thinking.to_string());
-            options.extra_json = Some(serde_json::json!({
-                "reasoning_effort": thinking,
-            }));
+            match self.mode {
+                ApiMode::ChatCompletions => {
+                    // SuperGlue drops `reasoning_effort` for models outside its effort table;
+                    // `extra_json` preserves it on the Chat Completions body.
+                    options.extra_json = Some(serde_json::json!({
+                        "reasoning_effort": thinking,
+                    }));
+                }
+                ApiMode::Responses => {
+                    // Responses maps `options.reasoning_effort` to `reasoning.effort` and
+                    // rejects a top-level `reasoning_effort` key.
+                }
+            }
             if let Some(temperature) = temperature {
                 options.temperature = Some(temperature);
             }
@@ -823,8 +833,7 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_mode_keeps_top_level_reasoning_effort() {
         let sse = "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let body =
-            run_one_completion(ApiMode::ChatCompletions, "custom-model", "high", sse).await;
+        let body = run_one_completion(ApiMode::ChatCompletions, "custom-model", "high", sse).await;
         assert_eq!(body["reasoning_effort"], "high");
     }
 }
