@@ -712,10 +712,14 @@ mod tests {
         completer.set_credentials(creds);
 
         let tools = superglue::tools::ToolRegistry::new();
-        let messages = vec![TurnMessage::text(TurnRole::User, "hello")];
-        let prompt = PromptBlocks::default();
+        let messages = vec![TurnMessage {
+            role: TurnRole::User,
+            text: "hello".to_string(),
+            images: Vec::new(),
+        }];
+        let prompt = PromptBlocks::cached_only("system");
         let lane = Arc::new(PieceLane::new());
-        let reply = completer
+        let reply = match completer
             .complete(CompletionRequest {
                 prompt: &prompt,
                 messages: &messages,
@@ -732,7 +736,19 @@ mod tests {
                 watch_tools: false,
             })
             .await
-            .expect("completion should succeed");
+        {
+            Ok(reply) => reply,
+            Err(crate::turn::CompleterError::Cancelled) => panic!("completion cancelled"),
+            Err(crate::turn::CompleterError::Credentials(msg)) => {
+                panic!("completion credentials error: {msg}")
+            }
+            Err(crate::turn::CompleterError::Failed(msg)) => {
+                panic!("completion failed: {msg}")
+            }
+            Err(crate::turn::CompleterError::Plugin(msg)) => {
+                panic!("completion plugin error: {msg}")
+            }
+        };
         assert_eq!(reply.text, "ok");
         rx.recv().expect("receive captured request body")
     }
