@@ -10,7 +10,7 @@ cargo test --offline
 cargo clippy --all-targets -- -D warnings
 ```
 
-`cargo test --offline` uses the lockfile and the local SuperGlue path. It does not call a provider.
+`cargo test --offline` uses the lockfile and the local Cargo cache. Run `cargo fetch` once when `superglue` is not cached. It does not call a provider.
 
 ## Examples
 

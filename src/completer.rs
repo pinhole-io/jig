@@ -633,11 +633,109 @@ fn secret_span(lower: &str, index: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, mpsc};
+    use std::thread;
 
-    use super::{apply_prompt_blocks, chat_message};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ApiMode, SuperGlueCompleter, apply_prompt_blocks, chat_message};
     use crate::prompt::PromptBlocks;
-    use crate::turn::{TurnImage, TurnMessage, TurnRole};
+    use crate::stream::PieceLane;
+    use crate::turn::{Completer, CompletionRequest, TurnImage, TurnMessage, TurnRole};
+
+    fn spawn_capture_server(sse_body: &'static str) -> (String, mpsc::Receiver<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback test server");
+        let addr = listener.local_addr().expect("read local addr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read request headers");
+                assert!(n > 0, "unexpected EOF before headers");
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&raw[..header_end]);
+            let content_len: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_len {
+                let n = stream.read(&mut chunk).expect("read request body");
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&raw[header_end..header_end + content_len])
+                    .expect("parse request JSON");
+            let _ = tx.send(body);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                sse_body.len(),
+                sse_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write SSE response");
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    async fn run_one_completion(
+        mode: ApiMode,
+        model: &str,
+        thinking: &str,
+        sse_body: &'static str,
+    ) -> serde_json::Value {
+        let (base_url, rx) = spawn_capture_server(sse_body);
+        let http = superglue::http::HttpClient::new(superglue::http::ClientConfig::default())
+            .expect("build http client");
+        let completer = SuperGlueCompleter::from_client(http)
+            .with_mode(mode)
+            .with_base_url(base_url.clone());
+        let mut creds = superglue::providers::ProviderCredentials::default();
+        creds.insert_key(superglue::providers::ProviderId::OpenAi, "test-key");
+        creds.insert_base_url(superglue::providers::ProviderId::OpenAi, base_url);
+        completer.set_credentials(creds);
+
+        let tools = superglue::tools::ToolRegistry::new();
+        let messages = vec![TurnMessage::text(TurnRole::User, "hello")];
+        let prompt = PromptBlocks::default();
+        let lane = Arc::new(PieceLane::new());
+        let reply = completer
+            .complete(CompletionRequest {
+                prompt: &prompt,
+                messages: &messages,
+                transcript: &[],
+                tools: &tools,
+                model,
+                thinking,
+                max_tool_rounds: 1,
+                cancel: CancellationToken::new(),
+                lane,
+                steering: None,
+                answer_after_tool_cap: false,
+                temperature: None,
+                watch_tools: false,
+            })
+            .await
+            .expect("completion should succeed");
+        assert_eq!(reply.text, "ok");
+        rx.recv().expect("receive captured request body")
+    }
 
     #[test]
     fn prompt_blocks_map_to_cached_prefix_and_volatile_suffix() {
@@ -693,5 +791,24 @@ mod tests {
         let text = super::safe_text("authorization failed: bearer sk-live-secret tail");
         assert!(!text.contains("sk-live"));
         assert!(text.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn responses_mode_sends_nested_reasoning_effort_without_top_level_key() {
+        let sse = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n";
+        let body = run_one_completion(ApiMode::Responses, "gpt-6-luna", "high", sse).await;
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "Responses API rejects top-level reasoning_effort: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_mode_keeps_top_level_reasoning_effort() {
+        let sse = "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let body =
+            run_one_completion(ApiMode::ChatCompletions, "custom-model", "high", sse).await;
+        assert_eq!(body["reasoning_effort"], "high");
     }
 }

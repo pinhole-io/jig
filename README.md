@@ -26,25 +26,16 @@ The caller supplies the tool registry, the completer, and the drivers. Model cal
 ## Requirements
 
 - Rust 1.88 or newer. `rust-version` in `Cargo.toml` sets this floor.
-- A sibling checkout of [superglue](https://github.com/pinhole-io/superglue). Cargo resolves `path = "../superglue"`.
+- Network access on the first build so Cargo can fetch [superglue](https://github.com/pinhole-io/superglue) from git.
 - `OPENAI_API_KEY` when you run `03_one_turn`. The other examples stay on this machine.
 
 ## Install
 
-There is no crates.io package. Clone the two repositories as siblings.
+There is no crates.io package. Clone this repository. Cargo fetches [superglue](https://github.com/pinhole-io/superglue) from git.
 
 ```bash
-mkdir -p ~/src && cd ~/src
 git clone https://github.com/pinhole-io/jig.git
-git clone https://github.com/pinhole-io/superglue.git
-```
-
-You need this layout:
-
-```text
-~/src/
-  jig/
-  superglue/
+cd jig
 ```
 
 | Surface | Where it runs | How to build |
@@ -54,10 +45,9 @@ You need this layout:
 
 ## Quick start
 
-`01_agent_spec` and `02_prompt` do not call a model. The sibling checkout is still required.
+`01_agent_spec` and `02_prompt` do not call a model.
 
 ```bash
-cd jig
 cargo test
 cargo run --example 01_agent_spec
 cargo run --example 02_prompt
@@ -121,8 +111,8 @@ Keep the API key in the environment. Do not commit it.
 
 | What you see | What to do |
 | --- | --- |
-| `can't find crate superglue` | Clone SuperGlue next to this repository. See [Install](#install). |
-| `01_agent_spec` fails to build | The example does not call a model. The path dependency is still required. |
+| `can't find crate superglue` or git fetch fails | Allow Cargo to reach `https://github.com/pinhole-io/superglue`, then run `cargo fetch`. |
+| `01_agent_spec` fails to build offline | Run `cargo fetch` once with network access so Cargo caches `superglue`. |
 | `03_one_turn` prints `Set OPENAI_API_KEY` | Export the key, then run the example again. |
 | The chooser runs on a one-lane agent | Put one id in `AgentSpec::drivers`. More than one id asks the chooser. |
 | A plugin workflow returns `invalid workflow id` | Use `plugin/name`. Lowercase letters, digits, and `-` only. `chat` is reserved. |

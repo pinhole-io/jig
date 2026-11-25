@@ -17,7 +17,7 @@ jiff = "0.2"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-superglue = { path = "../superglue", default-features = false }
+superglue = { git = "https://github.com/pinhole-io/superglue", branch = "main", default-features = false }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tracing = "0.1"
