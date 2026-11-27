@@ -111,6 +111,7 @@ pub struct TurnInput<'a> {
     pub model: &'a str,
     pub thinking: &'a str,
     pub temperature: Option<f32>,
+    pub steering: Option<superglue::chat::RoundBoundary>,
 }
 
 /// The finished turn.
@@ -218,49 +219,52 @@ impl AgentRunner {
         let lane = Arc::new(PieceLane::new());
         let mut reply = String::new();
         let mut reasoning = String::new();
-        let run = completer.complete(CompletionRequest {
-            prompt: &prompt,
-            messages: &messages,
-            transcript: &transcript,
-            tools: &tools,
-            model: input.model,
-            thinking: input.thinking,
-            max_tool_rounds: rounds,
-            cancel: input.cancel.clone(),
-            lane: Arc::clone(&lane),
-            steering: None,
-            answer_after_tool_cap: true,
-            temperature: input.temperature,
-            watch_tools: true,
-        });
-        tokio::pin!(run);
-        let mut result = None;
-        loop {
-            let batch = lane.take();
-            if batch.is_empty() {
-                if result.is_some() {
-                    break;
-                }
-                let notified = lane.notified();
-                tokio::pin!(notified);
-                tokio::select! {
-                    biased;
-                    finished = &mut run => {
-                        result = Some(finished);
+        let result = {
+            let run = completer.complete(CompletionRequest {
+                prompt: &prompt,
+                messages: &messages,
+                transcript: &transcript,
+                tools: &tools,
+                model: input.model,
+                thinking: input.thinking,
+                max_tool_rounds: rounds,
+                cancel: input.cancel.clone(),
+                lane: Arc::clone(&lane),
+                steering: input.steering,
+                answer_after_tool_cap: true,
+                temperature: input.temperature,
+                watch_tools: true,
+            });
+            tokio::pin!(run);
+            let mut result = None;
+            loop {
+                let batch = lane.take();
+                if batch.is_empty() {
+                    if result.is_some() {
+                        break;
                     }
-                    _ = &mut notified => {}
-                }
-            } else {
-                for piece in batch {
-                    match &piece {
-                        StreamPiece::Text(text) => reply.push_str(text),
-                        StreamPiece::Reasoning(text) => reasoning.push_str(text),
-                        StreamPiece::Tool(_) => {}
+                    let notified = lane.notified();
+                    tokio::pin!(notified);
+                    tokio::select! {
+                        biased;
+                        finished = &mut run => {
+                            result = Some(finished);
+                        }
+                        _ = &mut notified => {}
                     }
-                    on_piece(piece);
+                } else {
+                    for piece in batch {
+                        match &piece {
+                            StreamPiece::Text(text) => reply.push_str(text),
+                            StreamPiece::Reasoning(text) => reasoning.push_str(text),
+                            StreamPiece::Tool(_) => {}
+                        }
+                        on_piece(piece);
+                    }
                 }
             }
-        }
+            result
+        };
         let finished = result.unwrap_or(Err(CompleterError::Failed(
             "turn produced no result".to_string(),
         )));
@@ -287,7 +291,17 @@ impl AgentRunner {
             .verify(&decision.state, &tools)
             .await;
         let transcript = if next_transcript.is_empty() {
-            fallback_transcript(&messages, &reply)
+            if transcript.is_empty() {
+                fallback_transcript(&messages, &reply)
+            } else {
+                if !reply.is_empty() {
+                    transcript.push(superglue::openai::ChatMessage::text(
+                        "assistant",
+                        reply.clone(),
+                    ));
+                }
+                transcript
+            }
         } else {
             next_transcript
         };
@@ -440,5 +454,410 @@ fn error_from_completer(err: CompleterError) -> TurnError {
         CompleterError::Credentials(reason)
         | CompleterError::Failed(reason)
         | CompleterError::Plugin(reason) => TurnError::Failed(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{AgentRunner, EngineDriver, StaticDriver, TurnInput};
+    use crate::agent::{
+        AgentSpec, CoordinationSource, DoneCheck, RoundBudget, ToolPolicy, ToolSet,
+    };
+    use crate::completer::{ApiMode, SuperGlueCompleter};
+    use crate::control::{Budget, TaskType, VerifierRegistry, WorkflowRegistry};
+    use crate::turn::{TurnMessage, TurnRole};
+
+    const ANSWER_SPEC: AgentSpec = AgentSpec {
+        id: "test-answer",
+        prompt: "Answer briefly.",
+        instructions: "",
+        tools: ToolPolicy::fixed(ToolSet::All),
+        max_tool_rounds: RoundBudget::Fixed(1),
+        coordination: CoordinationSource::Single,
+        drivers: &["answer"],
+        worktree: false,
+        done_check: DoneCheck::None,
+        children: &[],
+        swarm: false,
+        primary: true,
+        awaits_verify: false,
+        tools_error: "",
+    };
+
+    const TOOL_SPEC: AgentSpec = AgentSpec {
+        id: "test-tools",
+        prompt: "Use tools when needed.",
+        instructions: "",
+        tools: ToolPolicy::fixed(ToolSet::All),
+        max_tool_rounds: RoundBudget::Fixed(4),
+        coordination: CoordinationSource::Single,
+        drivers: &["tool_loop"],
+        worktree: false,
+        done_check: DoneCheck::None,
+        children: &[],
+        swarm: false,
+        primary: true,
+        awaits_verify: false,
+        tools_error: "",
+    };
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl superglue::tools::Tool for EchoTool {
+        fn spec(&self) -> superglue::tools::ToolSpec {
+            superglue::tools::ToolSpec {
+                name: "echo".to_string(),
+                description: None,
+                parameters_schema: json!({"type": "object"}),
+                static_tool: false,
+            }
+        }
+
+        async fn call(
+            &self,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, superglue::tools::ToolInvokeError> {
+            Ok(json!({"echo": arguments}))
+        }
+    }
+
+    fn spawn_multi_sse_server(
+        responses: Vec<String>,
+    ) -> (String, mpsc::Receiver<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for sse_body in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let n = stream.read(&mut chunk).expect("read headers");
+                    assert!(n > 0, "unexpected EOF before headers");
+                    raw.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&raw[..header_end]);
+                let content_len: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while raw.len() < header_end + content_len {
+                    let n = stream.read(&mut chunk).expect("read body");
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&raw[header_end..header_end + content_len])
+                        .expect("parse JSON body");
+                let _ = tx.send(body);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse_body.len(),
+                    sse_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write SSE response");
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn text_sse(text: &str) -> String {
+        let first = json!({
+            "id": "chatcmpl_text",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-6-luna",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": null,
+            }]
+        });
+        let stop = json!({
+            "id": "chatcmpl_text",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-6-luna",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }]
+        });
+        format!("data: {first}\n\ndata: {stop}\n\ndata: [DONE]\n\n")
+    }
+
+    fn tool_call_sse(name: &str, args: &str) -> String {
+        let start = json!({
+            "id": "chatcmpl_tool",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-6-luna",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    }]
+                },
+                "finish_reason": null,
+            }]
+        });
+        let finish = json!({
+            "id": "chatcmpl_tool",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "gpt-6-luna",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": args},
+                    }]
+                },
+                "finish_reason": "tool_calls",
+            }]
+        });
+        format!("data: {start}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+    }
+
+    fn build_test_completer(base_url: String) -> SuperGlueCompleter {
+        let http = superglue::http::HttpClient::new(superglue::http::ClientConfig::default())
+            .expect("http client");
+        let completer = SuperGlueCompleter::from_client(http)
+            .with_mode(ApiMode::ChatCompletions)
+            .with_base_url(base_url.clone());
+        let mut creds = superglue::providers::ProviderCredentials::default();
+        creds.insert_key(superglue::providers::ProviderId::OpenAi, "test-key");
+        creds.insert_base_url(superglue::providers::ProviderId::OpenAi, base_url);
+        completer.set_credentials(creds);
+        completer
+    }
+
+    #[tokio::test]
+    async fn runner_invokes_round_boundary_steering_between_tool_rounds() {
+        let (base_url, rx) =
+            spawn_multi_sse_server(vec![tool_call_sse("echo", "{\"x\":1}"), text_sse("done")]);
+        let completer = build_test_completer(base_url);
+        let tools = superglue::tools::ToolRegistry::new();
+        tools
+            .register(Arc::new(EchoTool))
+            .await
+            .expect("register echo");
+        let drivers: Vec<Arc<dyn EngineDriver>> = vec![Arc::new(StaticDriver {
+            id: "tool_loop",
+            chooser_line: "Use tools.",
+            budget: Budget::tool_loop(),
+            task: None,
+            allowlist: &[],
+            prompt: "",
+            rounds: Some(4),
+            deny_tools: false,
+        })];
+        let workflows = WorkflowRegistry::with_chat(4);
+        let verifiers = VerifierRegistry::with_builtins();
+        let boundary_calls = Arc::new(AtomicUsize::new(0));
+        let boundary_calls_hook = Arc::clone(&boundary_calls);
+        let steering: superglue::chat::RoundBoundary = Arc::new(move || {
+            let calls = Arc::clone(&boundary_calls_hook);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![superglue::openai::ChatMessage::text(
+                    "user",
+                    "steered after tool round",
+                )])
+            })
+        });
+
+        let outcome = AgentRunner::run(
+            &completer,
+            TurnInput {
+                spec: &TOOL_SPEC,
+                drivers: &drivers,
+                workflows: &workflows,
+                verifiers: &verifiers,
+                tools: &tools,
+                history: &[],
+                transcript: &[],
+                user_text: "run echo",
+                volatile: &[],
+                cancel: CancellationToken::new(),
+                single: true,
+                unattended: false,
+                server_rounds: 4,
+                swarm_steps: 4,
+                model: "gpt-6-luna",
+                thinking: "none",
+                temperature: None,
+                steering: Some(steering),
+            },
+            |_| {},
+        )
+        .await
+        .expect("turn succeeds");
+
+        assert_eq!(outcome.reply, "done");
+        assert_eq!(boundary_calls.load(Ordering::SeqCst), 1);
+        let _round_one_body = rx.recv().expect("round 1 request");
+        let round_two_body = rx.recv().expect("round 2 request");
+        let round_two_msgs = round_two_body["messages"]
+            .as_array()
+            .expect("round 2 messages");
+        assert!(
+            round_two_msgs.iter().any(|msg| {
+                msg["role"] == "user" && msg["content"] == "steered after tool round"
+            }),
+            "round 2 request must include steered boundary message: {round_two_msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_free_lane_preserves_prior_tool_and_image_transcript() {
+        let (base_url, _rx) = spawn_multi_sse_server(vec![text_sse("summary reply")]);
+        let completer = build_test_completer(base_url);
+        let tools = superglue::tools::ToolRegistry::new();
+        let drivers: Vec<Arc<dyn EngineDriver>> = vec![Arc::new(StaticDriver {
+            id: "answer",
+            chooser_line: "Answer without tools.",
+            budget: Budget::answer(),
+            task: Some(TaskType::Chat),
+            allowlist: &[],
+            prompt: "",
+            rounds: Some(1),
+            deny_tools: true,
+        })];
+        let workflows = WorkflowRegistry::with_chat(1);
+        let verifiers = VerifierRegistry::with_builtins();
+
+        let prior_transcript = vec![
+            superglue::openai::ChatMessage {
+                role: "user".to_string(),
+                content: Some(superglue::openai::MessageContent::Parts(vec![
+                    superglue::openai::ContentPart::Text {
+                        text: "inspect this screenshot".to_string(),
+                    },
+                    superglue::openai::ContentPart::ImageUrl {
+                        image_url: superglue::openai::ImageUrl {
+                            url: "data:image/png;base64,aW1hZ2U=".to_string(),
+                            detail: None,
+                        },
+                    },
+                ])),
+                ..Default::default()
+            },
+            superglue::openai::ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![superglue::openai::ToolCall {
+                    id: "call_prev".to_string(),
+                    kind: "function".to_string(),
+                    function: superglue::openai::FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: "{\"ok\":true}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            superglue::openai::ChatMessage {
+                role: "tool".to_string(),
+                content: Some(superglue::openai::MessageContent::Text(
+                    "{\"echo\":{\"ok\":true}}".to_string(),
+                )),
+                tool_call_id: Some("call_prev".to_string()),
+                name: Some("echo".to_string()),
+                ..Default::default()
+            },
+            superglue::openai::ChatMessage::text("assistant", "I checked it."),
+        ];
+        let prior_history = vec![
+            TurnMessage {
+                role: TurnRole::User,
+                text: "inspect this screenshot".to_string(),
+                images: Vec::new(),
+            },
+            TurnMessage {
+                role: TurnRole::Assistant,
+                text: "I checked it.".to_string(),
+                images: Vec::new(),
+            },
+        ];
+
+        let outcome = AgentRunner::run(
+            &completer,
+            TurnInput {
+                spec: &ANSWER_SPEC,
+                drivers: &drivers,
+                workflows: &workflows,
+                verifiers: &verifiers,
+                tools: &tools,
+                history: &prior_history,
+                transcript: &prior_transcript,
+                user_text: "summarize what happened",
+                volatile: &[],
+                cancel: CancellationToken::new(),
+                single: true,
+                unattended: false,
+                server_rounds: 1,
+                swarm_steps: 1,
+                model: "gpt-6-luna",
+                thinking: "none",
+                temperature: None,
+                steering: None,
+            },
+            |_| {},
+        )
+        .await
+        .expect("turn succeeds");
+
+        assert_eq!(outcome.reply, "summary reply");
+        assert_eq!(outcome.transcript.len(), 6);
+        assert!(matches!(
+            outcome.transcript[0].content.as_ref(),
+            Some(superglue::openai::MessageContent::Parts(parts)) if parts.len() == 2
+        ));
+        assert!(outcome.transcript[1].tool_calls.is_some());
+        assert_eq!(outcome.transcript[2].role, "tool");
+        assert_eq!(
+            outcome.transcript[4]
+                .content
+                .as_ref()
+                .and_then(|c| c.as_text()),
+            Some("summarize what happened")
+        );
+        assert_eq!(
+            outcome.transcript[5]
+                .content
+                .as_ref()
+                .and_then(|c| c.as_text()),
+            Some("summary reply")
+        );
     }
 }

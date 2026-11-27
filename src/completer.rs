@@ -164,7 +164,8 @@ impl SuperGlueCompleter {
         Ok(Self::from_client(http))
     }
 
-    /// Use a caller-built HTTP client. Credentials start as [`ProviderCredentials::from_env`].
+    /// Use a caller-built HTTP client. Credentials start as
+    /// [`superglue::providers::ProviderCredentials::from_env`].
     pub fn from_client(http: superglue::http::HttpClient) -> Self {
         Self {
             http,
@@ -263,6 +264,11 @@ impl Completer for SuperGlueCompleter {
         request: CompletionRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ModelReply, CompleterError>> + Send + 'a>> {
         Box::pin(async move {
+            if self.mode == ApiMode::Responses && request.steering.is_some() {
+                return Err(CompleterError::Failed(
+                    "round-boundary steering requires ChatCompletions mode".to_string(),
+                ));
+            }
             if request.watch_tools && !self.watch_installed.swap(true, Ordering::AcqRel) {
                 self.install_tool_watch().await;
             }
@@ -835,5 +841,62 @@ mod tests {
         let sse = "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"custom-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let body = run_one_completion(ApiMode::ChatCompletions, "custom-model", "high", sse).await;
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn responses_mode_rejects_round_boundary_steering() {
+        let base_url = "http://127.0.0.1:9".to_string();
+        let http = superglue::http::HttpClient::new(superglue::http::ClientConfig::default())
+            .expect("build http client");
+        let completer = SuperGlueCompleter::from_client(http)
+            .with_mode(ApiMode::Responses)
+            .with_base_url(base_url.clone());
+        let mut creds = superglue::providers::ProviderCredentials::default();
+        creds.insert_key(superglue::providers::ProviderId::OpenAi, "test-key");
+        creds.insert_base_url(superglue::providers::ProviderId::OpenAi, base_url);
+        completer.set_credentials(creds);
+
+        let tools = superglue::tools::ToolRegistry::new();
+        let messages = vec![TurnMessage {
+            role: TurnRole::User,
+            text: "hello".to_string(),
+            images: Vec::new(),
+        }];
+        let prompt = PromptBlocks::cached_only("system");
+        let lane = Arc::new(PieceLane::new());
+        let boundary: superglue::chat::RoundBoundary =
+            Arc::new(|| Box::pin(async { Ok(Vec::new()) }));
+
+        let result = completer
+            .complete(CompletionRequest {
+                prompt: &prompt,
+                messages: &messages,
+                transcript: &[],
+                tools: &tools,
+                model: "gpt-6-luna",
+                thinking: "high",
+                max_tool_rounds: 1,
+                cancel: CancellationToken::new(),
+                lane,
+                steering: Some(boundary),
+                answer_after_tool_cap: false,
+                temperature: None,
+                watch_tools: false,
+            })
+            .await;
+
+        match result {
+            Err(crate::turn::CompleterError::Failed(msg)) => {
+                assert_eq!(msg, "round-boundary steering requires ChatCompletions mode");
+            }
+            Ok(_) => panic!("Responses mode must reject round-boundary steering"),
+            Err(crate::turn::CompleterError::Cancelled) => panic!("unexpected Cancelled"),
+            Err(crate::turn::CompleterError::Credentials(msg)) => {
+                panic!("unexpected Credentials error: {msg}")
+            }
+            Err(crate::turn::CompleterError::Plugin(msg)) => {
+                panic!("unexpected Plugin error: {msg}")
+            }
+        }
     }
 }

@@ -76,6 +76,7 @@ async fn main() {
             model: &model,
             thinking: "none",
             temperature: None,
+            steering: None,
         },
         |piece| {
             if let StreamPiece::Text(text) = piece {
