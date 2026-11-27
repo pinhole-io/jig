@@ -91,6 +91,12 @@ impl superglue::hooks::HookHandler for WatchHook {
         if name == "agents" {
             return Ok(ctx);
         }
+        let call_id = ctx
+            .metadata
+            .get("tool_call_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
         match ctx.stage {
             superglue::hooks::HookStage::PreTool => {
                 lane.push(StreamPiece::Tool(ToolPiece {
@@ -99,7 +105,7 @@ impl superglue::hooks::HookHandler for WatchHook {
                     ok: true,
                     error: String::new(),
                     arguments: clip(&ctx.content, PREVIEW_CHARS),
-                    call_id: String::new(),
+                    call_id,
                     result: String::new(),
                 }));
             }
@@ -124,7 +130,7 @@ impl superglue::hooks::HookHandler for WatchHook {
                     ok,
                     error: error.unwrap_or_default(),
                     arguments: clip(&arguments, PREVIEW_CHARS),
-                    call_id: String::new(),
+                    call_id,
                     result: clip(&ctx.content, PREVIEW_CHARS),
                 }));
             }
